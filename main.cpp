@@ -9,8 +9,8 @@
 #include <iomanip>
 #include <cmath>
 #include <limits>
-#include <queue>
-#include <climits>
+#include <set>
+#include <cctype>
 using namespace std;
 
 // Simple CSV reader (handles quoted fields)
@@ -46,16 +46,14 @@ static vector<string> split_csv_line(const string &line) {
     return out;
 }
 
-// Try parse date to days since epoch (UTC). Supports common formats: YYYY-MM-DD and ISO-like.
+// Parse date string to days since epoch. Supports M/D/YY H:MM and variants.
 static bool parse_date_to_days(const string &s_in, long &out_days) {
     if (s_in.empty()) return false;
-    // trim
     string s = s_in;
     while (!s.empty() && isspace((unsigned char)s.back())) s.pop_back();
     size_t p = 0; while (p < s.size() && isspace((unsigned char)s[p])) ++p; if (p) s = s.substr(p);
 
     std::tm tm{};
-    // try a list of formats that appear in the CSVs (two-digit year with time, etc.)
     const vector<string> fmts = {
         "%m/%d/%y %H:%M",
         "%m/%d/%y %H:%M:%S",
@@ -66,7 +64,6 @@ static bool parse_date_to_days(const string &s_in, long &out_days) {
         "%Y-%m-%dT%H:%M:%S",
         "%Y-%m-%d"
     };
-
     for (const auto &fmt : fmts) {
         std::istringstream ss(s);
         ss >> std::get_time(&tm, fmt.c_str());
@@ -81,86 +78,51 @@ static bool parse_date_to_days(const string &s_in, long &out_days) {
     return false;
 }
 
-// Levenshtein distance
-static int levenshtein(const string &a, const string &b) {
-    int n = a.size(), m = b.size();
-    if (n == 0) return m;
-    if (m == 0) return n;
-    vector<int> prev(m+1), cur(m+1);
-    for (int j = 0; j <= m; ++j) prev[j] = j;
-    for (int i = 1; i <= n; ++i) {
-        cur[0] = i;
-        for (int j = 1; j <= m; ++j) {
-            int cost = (a[i-1] == b[j-1]) ? 0 : 1;
-            cur[j] = min({ prev[j] + 1, cur[j-1] + 1, prev[j-1] + cost });
+// Tokenize a string: lowercase alphanumeric tokens only
+static set<string> tokenize(const string &s) {
+    set<string> tokens;
+    string tok;
+    for (char c : s) {
+        if (isalnum((unsigned char)c)) {
+            tok.push_back(tolower((unsigned char)c));
+        } else {
+            if (!tok.empty()) { tokens.insert(tok); tok.clear(); }
         }
-        swap(prev, cur);
     }
-    return prev[m];
+    if (!tok.empty()) tokens.insert(tok);
+    return tokens;
 }
 
-// Hopcroft-Karp for maximum bipartite matching (left = bank tx)
-struct HopcroftKarp {
-    int n, m; // left size n, right size m
-    vector<vector<int>> adj; // adj from left to rights (0..m-1)
-    vector<int> dist, pairU, pairV;
-    HopcroftKarp(int n_, int m_): n(n_), m(m_), adj(n_) {
-        pairU.assign(n, -1);
-        pairV.assign(m, -1);
-        dist.resize(n);
+// Jaccard similarity on token sets.
+// Both empty -> 1.0 (identical); one empty -> 0.0.
+static double jaccard(const set<string> &a, const set<string> &b) {
+    if (a.empty() && b.empty()) return 1.0;
+    if (a.empty() || b.empty()) return 0.0;
+    int inter = 0;
+    for (const auto &t : a) if (b.count(t)) ++inter;
+    int uni = (int)(a.size() + b.size() - inter);
+    return (double)inter / uni;
+}
+
+// Escape a string for JSON output
+static string json_escape(const string &s) {
+    string r;
+    for (char c : s) {
+        if (c == '"')  r += "\\\"";
+        else if (c == '\\') r += "\\\\";
+        else if (c == '\n') r += "\\n";
+        else if (c == '\r') r += "\\r";
+        else if (c == '\t') r += "\\t";
+        else r.push_back(c);
     }
-    void addEdge(int u, int v) { adj[u].push_back(v); }
-    bool bfs() {
-        queue<int> q;
-        for (int u = 0; u < n; ++u) {
-            if (pairU[u] == -1) { dist[u] = 0; q.push(u); }
-            else dist[u] = INT_MAX;
-        }
-        bool reachableFree = false;
-        while(!q.empty()) {
-            int u = q.front(); q.pop();
-            for (int v: adj[u]) {
-                int pu = pairV[v];
-                if (pu != -1 && dist[pu] == INT_MAX) {
-                    dist[pu] = dist[u] + 1;
-                    q.push(pu);
-                }
-                if (pu == -1) reachableFree = true;
-            }
-        }
-        return reachableFree;
-    }
-    bool dfs(int u) {
-        for (int v: adj[u]) {
-            int pu = pairV[v];
-            if (pu == -1 || (dist[pu] == dist[u] + 1 && dfs(pu))) {
-                pairU[u] = v;
-                pairV[v] = u;
-                return true;
-            }
-        }
-        dist[u] = INT_MAX;
-        return false;
-    }
-    int maxMatching() {
-        int matching = 0;
-        while (bfs()) {
-            for (int u = 0; u < n; ++u) {
-                if (pairU[u] == -1) {
-                    if (dfs(u)) matching++;
-                }
-            }
-        }
-        return matching;
-    }
-};
+    return r;
+}
 
 int main(int argc, char** argv) {
     string bt_path = "bank_transactions.csv";
     string gl_path = "general_ledger.csv";
     if (argc >= 3) { bt_path = argv[1]; gl_path = argv[2]; }
 
-    // Read CSV files
     auto read_csv = [&](const string &path) {
         ifstream f(path);
         if (!f) { cerr << "Failed to open " << path << "\n"; exit(1); }
@@ -171,10 +133,8 @@ int main(int argc, char** argv) {
         string line;
         while (std::getline(f, line)) {
             rows.push_back(split_csv_line(line));
-            // pad if needed
             if (rows.back().size() < cols.size()) rows.back().resize(cols.size());
         }
-        // prepend header as first row (so caller can use)
         rows.insert(rows.begin(), cols);
         return rows;
     };
@@ -186,118 +146,158 @@ int main(int argc, char** argv) {
     vector<string> bt_header = bt_rows[0];
     vector<string> gl_header = gl_rows[0];
     unordered_map<string,int> bt_col, gl_col;
-    for (size_t i=0;i<bt_header.size();++i) bt_col[bt_header[i]] = i;
-    for (size_t i=0;i<gl_header.size();++i) gl_col[gl_header[i]] = i;
+    for (size_t i = 0; i < bt_header.size(); ++i) bt_col[bt_header[i]] = i;
+    for (size_t i = 0; i < gl_header.size(); ++i) gl_col[gl_header[i]] = i;
 
     struct Bank { int idx; long day; double amount; string desc; string datetime_raw; };
-    struct GL { string journal_id; long day; double amount; string desc; string datetime_raw; };
+    struct GL   { string journal_id; long day; double amount; string desc; string datetime_raw; };
 
+    // --- Parse bank transactions ---
     vector<Bank> banks;
     for (size_t r = 1; r < bt_rows.size(); ++r) {
         auto &row = bt_rows[r];
-        Bank b; b.idx = (int)(r-1);
-        string dt = ""; if (bt_col.count("datetime")) dt = row[bt_col["datetime"]];
+        Bank b;
+        b.idx = (int)(r - 1);
+        string dt = bt_col.count("datetime") ? row[bt_col["datetime"]] : string("");
         b.datetime_raw = dt;
-        long day = 0; bool hasDate = parse_date_to_days(dt, day);
-        b.day = hasDate ? day : LONG_MIN/4;
+        long day = 0;
+        b.day = parse_date_to_days(dt, day) ? day : LONG_MIN / 4;
         string amt_s = bt_col.count("amount") ? row[bt_col["amount"]] : string("");
-        try { b.amount = stod(amt_s); } catch(...) { b.amount = numeric_limits<double>::quiet_NaN(); }
+        try { b.amount = stod(amt_s); } catch (...) { b.amount = numeric_limits<double>::quiet_NaN(); }
         b.desc = bt_col.count("description") ? row[bt_col["description"]] : string("");
         banks.push_back(move(b));
     }
 
-    // Build grouped result from GL preserving first-seen order of journal_entry_id
+    // --- Parse and aggregate GL by journal_entry_id ---
+    // entry_datetime : first line's datetime
+    // entry_amount   : sum of all line amounts
+    // entry_description : space-separated non-empty descriptions from all lines
     unordered_map<string,int> seen_idx;
-    vector<GL> results;
+    vector<GL> gl_entries;
     for (size_t r = 1; r < gl_rows.size(); ++r) {
         auto &row = gl_rows[r];
-        string jid = gl_col.count("journal_entry_id") ? row[gl_col["journal_entry_id"]] : to_string(r-1);
+        string jid = gl_col.count("journal_entry_id") ? row[gl_col["journal_entry_id"]] : to_string(r - 1);
+        string line_desc = gl_col.count("description") ? row[gl_col["description"]] : string("");
+        string amt_s    = gl_col.count("amount")       ? row[gl_col["amount"]]       : string("");
+        double v = 0;
+        try { v = stod(amt_s); } catch (...) { v = 0; }
+
         if (!seen_idx.count(jid)) {
-            GL g; g.journal_id = jid;
+            GL g;
+            g.journal_id = jid;
             string dt = gl_col.count("datetime") ? row[gl_col["datetime"]] : string("");
             g.datetime_raw = dt;
-            long day = 0; bool hasDate = parse_date_to_days(dt, day);
-            g.day = hasDate ? day : LONG_MIN/4;
-            string amt_s = gl_col.count("amount") ? row[gl_col["amount"]] : string("");
-            try { g.amount = stod(amt_s); } catch(...) { g.amount = numeric_limits<double>::quiet_NaN(); }
-            g.desc = gl_col.count("description") ? row[gl_col["description"]] : string("");
-            seen_idx[jid] = (int)results.size();
-            results.push_back(move(g));
+            long day = 0;
+            g.day = parse_date_to_days(dt, day) ? day : LONG_MIN / 4;
+            g.amount = v;
+            g.desc   = line_desc;
+            seen_idx[jid] = (int)gl_entries.size();
+            gl_entries.push_back(move(g));
         } else {
-            // aggregate amount (sum)
             int idx = seen_idx[jid];
-            string amt_s = gl_col.count("amount") ? row[gl_col["amount"]] : string("");
-            double v = 0; try { v = stod(amt_s); } catch(...) { v = 0; }
-            if (isnan(results[idx].amount)) results[idx].amount = v; else results[idx].amount += v;
-            // keep first description and datetime as-is
+            gl_entries[idx].amount += v;
+            // concatenate non-empty descriptions
+            if (!line_desc.empty()) {
+                if (gl_entries[idx].desc.empty())
+                    gl_entries[idx].desc = line_desc;
+                else
+                    gl_entries[idx].desc += " " + line_desc;
+            }
         }
     }
 
-    int n_bt = banks.size();
-    int n_res = results.size();
+    int n_bt = (int)banks.size();
+    int n_gl = (int)gl_entries.size();
 
-    HopcroftKarp hk(n_bt, n_res);
+    // --- Build candidate pairs ---
+    // Constraints:
+    //   date window  : |bank_day - gl_day| <= 15
+    //   amount policy: absolute — |abs(bank_amount) - abs(gl_amount)| <= 0.1
+    // Score: Jaccard token similarity of descriptions
+    const int    day_window = 15;
+    const double tol        = 0.1;
 
-    // Build edges with filters: date within 15 days and amounts within tol
-    const int day_window = 15;
-    const double tol = 0.01;
+    struct Candidate { int bank_idx; int gl_idx; double score; };
+    vector<Candidate> candidates;
+
     for (int i = 0; i < n_bt; ++i) {
-        for (int j = 0; j < n_res; ++j) {
-            // require both valid dates
-            if (banks[i].day <= LONG_MIN/10 || results[j].day <= LONG_MIN/10) continue;
-            if (llabs(banks[i].day - results[j].day) > day_window) continue;
-            if (isnan(banks[i].amount) || isnan(results[j].amount)) continue;
-            if (fabs(fabs(banks[i].amount) - fabs(results[j].amount)) > tol) continue;
-            if (banks[i].desc.empty() || results[j].desc.empty()) continue;
-            hk.addEdge(i, j);
+        if (banks[i].day <= LONG_MIN / 10 || isnan(banks[i].amount)) continue;
+        auto bank_tok = tokenize(banks[i].desc);
+        for (int j = 0; j < n_gl; ++j) {
+            if (gl_entries[j].day <= LONG_MIN / 10 || isnan(gl_entries[j].amount)) continue;
+            if (llabs(banks[i].day - gl_entries[j].day) > day_window) continue;
+            if (fabs(fabs(banks[i].amount) - fabs(gl_entries[j].amount)) > tol) continue;
+            auto gl_tok = tokenize(gl_entries[j].desc);
+            double score = jaccard(bank_tok, gl_tok);
+            candidates.push_back({i, j, score});
         }
     }
 
-    int matching = hk.maxMatching();
-    cerr << "Max matching: " << matching << "\n";
+    // --- Score-greedy one-to-one matching ---
+    // Primary objective  : maximize total similarity score
+    // Secondary objective: maximize number of matches
+    // Tie-break          : lower bank_idx, then lower gl_idx (deterministic)
+    sort(candidates.begin(), candidates.end(), [](const Candidate &a, const Candidate &b) {
+        if (a.score != b.score) return a.score > b.score;
+        if (a.bank_idx != b.bank_idx) return a.bank_idx < b.bank_idx;
+        return a.gl_idx < b.gl_idx;
+    });
 
-    // Prepare output matches similar to notebook: for each matched pair produce score using Levenshtein ratio
-    vector<tuple<string,string,double,string,int,string,double,string,double>> output; // journal_id, gl_datetime, gl_amount, gl_desc, bank_index, bank_datetime, bank_amount, bank_desc, score
-    for (int i = 0; i < n_bt; ++i) {
-        int v = hk.pairU[i];
-        if (v != -1) {
-            const auto &g = results[v];
-            const auto &b = banks[i];
-            int dist = levenshtein(g.desc, b.desc);
-            int maxl = max((int)g.desc.size(), (int)b.desc.size());
-            double ratio = (maxl == 0) ? 1.0 : 1.0 - (double)dist / (double)maxl; // simple ratio
-            output.emplace_back(g.journal_id, g.datetime_raw, g.amount, g.desc, b.idx, b.datetime_raw, b.amount, b.desc, ratio);
-        }
+    vector<bool> bank_used(n_bt, false);
+    vector<bool> gl_used(n_gl, false);
+
+    struct Match {
+        string journal_id, gl_datetime, gl_desc;
+        double gl_amount;
+        int    bank_index;
+        string bank_datetime, bank_desc;
+        double bank_amount, score;
+    };
+    vector<Match> matches;
+
+    for (const auto &c : candidates) {
+        if (bank_used[c.bank_idx] || gl_used[c.gl_idx]) continue;
+        bank_used[c.bank_idx] = true;
+        gl_used[c.gl_idx]     = true;
+        const auto &b = banks[c.bank_idx];
+        const auto &g = gl_entries[c.gl_idx];
+        matches.push_back({g.journal_id, g.datetime_raw, g.desc, g.amount,
+                           b.idx, b.datetime_raw, b.desc, b.amount, c.score});
     }
 
-    // Write matches.json
+    // --- Write matches.json ---
     ofstream out("matches.json");
     out << "[\n";
-    for (size_t k = 0; k < output.size(); ++k) {
-        auto &t = output[k];
-        string jid = get<0>(t);
-        string gdt = get<1>(t);
-        double gamt = get<2>(t);
-        string gdesc = get<3>(t);
-        int bidx = get<4>(t);
-        string bdt = get<5>(t);
-        double bam = get<6>(t);
-        string bdesc = get<7>(t);
-        double score = get<8>(t);
+    for (size_t k = 0; k < matches.size(); ++k) {
+        const auto &m = matches[k];
         out << "  {\n";
-        out << "    \"journal_entry_id\": \"" << jid << "\",\n";
-        out << "    \"gl_datetime\": " << (gdt.empty() ? string("null") : string("\"") + gdt + "\"") << ",\n";
-        if (isnan(gamt)) out << "    \"gl_amount\": null,\n"; else out << "    \"gl_amount\": " << fixed << setprecision(2) << gamt << ",\n";
-        out << "    \"gl_description\": " << (gdesc.empty() ? string("null") : string("\"") + gdesc + "\"") << ",\n";
-        out << "    \"bank_index\": " << bidx << ",\n";
-        out << "    \"bank_datetime\": " << (bdt.empty() ? string("null") : string("\"") + bdt + "\"") << ",\n";
-        if (isnan(bam)) out << "    \"bank_amount\": null,\n"; else out << "    \"bank_amount\": " << fixed << setprecision(2) << bam << ",\n";
-        out << "    \"bank_description\": " << (bdesc.empty() ? string("null") : string("\"") + bdesc + "\"") << ",\n";
-        out << "    \"score\": " << fixed << setprecision(6) << score << "\n";
-        out << "  }" << (k+1<output.size()? ",\n" : "\n");
+        out << "    \"journal_entry_id\": \""  << json_escape(m.journal_id)   << "\",\n";
+        out << "    \"gl_datetime\": "
+            << (m.gl_datetime.empty() ? "null" : "\"" + json_escape(m.gl_datetime) + "\"") << ",\n";
+        out << "    \"gl_amount\": "           << fixed << setprecision(2) << m.gl_amount   << ",\n";
+        out << "    \"gl_description\": "
+            << (m.gl_desc.empty() ? "null" : "\"" + json_escape(m.gl_desc) + "\"") << ",\n";
+        out << "    \"bank_index\": "          << m.bank_index                              << ",\n";
+        out << "    \"bank_datetime\": "
+            << (m.bank_datetime.empty() ? "null" : "\"" + json_escape(m.bank_datetime) + "\"") << ",\n";
+        out << "    \"bank_amount\": "         << fixed << setprecision(2) << m.bank_amount << ",\n";
+        out << "    \"bank_description\": "
+            << (m.bank_desc.empty() ? "null" : "\"" + json_escape(m.bank_desc) + "\"") << ",\n";
+        out << "    \"score\": "               << fixed << setprecision(6) << m.score       << "\n";
+        out << "  }" << (k + 1 < matches.size() ? "," : "") << "\n";
     }
     out << "]\n";
     out.close();
-    cerr << "Wrote matches.json with " << output.size() << " records\n";
+
+    // --- Summary ---
+    int n_matched = (int)matches.size();
+    cout << "GL entries:        " << n_gl    << "\n";
+    cout << "Bank transactions: " << n_bt    << "\n";
+    cout << "Matched:           " << n_matched << "\n";
+    cout << "Bank match rate:   " << fixed << setprecision(1)
+         << (n_bt > 0 ? 100.0 * n_matched / n_bt : 0.0) << "%\n";
+    cout << "GL match rate:     " << fixed << setprecision(1)
+         << (n_gl > 0 ? 100.0 * n_matched / n_gl : 0.0) << "%\n";
+
     return 0;
 }
