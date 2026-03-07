@@ -11,6 +11,7 @@
 #include <limits>
 #include <set>
 #include <cctype>
+#include <climits>
 using namespace std;
 
 // Simple CSV reader (handles quoted fields)
